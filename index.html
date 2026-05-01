@@ -177,6 +177,10 @@ const CFG = {
   deathLockoutMs: 800,                 // a touch longer to avoid retrigger
   // gesture confidence — LOWER = more sensitive
   fistConfidence: 0.40,                // was 0.55 — accept partial fists
+  // music — set to the BPM of your track so spawn cadence locks to the beat
+  musicBpm: 130,
+  musicUrl: 'audio/track.mp3',         // expected file location relative to index.html
+  musicVolume: 0.55,
 };
 
 // =============================================================
@@ -190,6 +194,90 @@ const JUMP_DISTANCE_BLOCKS = JUMP_DISTANCE_PX / BLOCK_PX;
 const MAX_CLUSTER_BLOCKS = JUMP_DISTANCE_BLOCKS * 0.75;       // ~2.85 blocks
 // Min rest distance between patterns — enough to land and re-jump comfortably.
 const MIN_REST_BLOCKS = JUMP_DISTANCE_BLOCKS * 1.20;          // ~4.6 blocks
+
+// =============================================================
+// AUDIO — music + procedural SFX
+// =============================================================
+// Browsers require a user gesture before any audio plays. We lazy-create the
+// AudioContext on the first tap/click. SFX (jump, crash) are synthesized via
+// Web Audio so we don't need extra files. Music is an HTMLAudioElement
+// pointing at audio/track.mp3 — bring your own file (see README).
+let audioCtx = null;
+let musicEl = null;
+let musicReady = false;
+
+function initAudio() {
+  if (audioCtx) return;
+  try {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  } catch (e) { /* iOS Safari may need a click — that's the gesture */ }
+
+  // Music as an Audio element, looped
+  musicEl = new Audio(CFG.musicUrl);
+  musicEl.loop = true;
+  musicEl.volume = CFG.musicVolume;
+  musicEl.preload = 'auto';
+  musicEl.addEventListener('canplaythrough', () => { musicReady = true; });
+  musicEl.addEventListener('error', () => {
+    console.warn('Music file not found at', CFG.musicUrl, '— gameplay continues silently');
+  });
+}
+
+function startMusic() {
+  if (!musicEl) return;
+  // Restart from top when starting/restarting a run
+  try {
+    musicEl.currentTime = 0;
+    const playP = musicEl.play();
+    if (playP && playP.catch) playP.catch(() => { /* autoplay policy */ });
+  } catch (e) { /* ignore */ }
+}
+
+function stopMusic() {
+  if (!musicEl) return;
+  try { musicEl.pause(); } catch (e) {}
+}
+
+// Procedural SFX. Each is a short envelope on a synth voice.
+function playJumpSfx() {
+  if (!audioCtx) return;
+  const t = audioCtx.currentTime;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = 'square';
+  // Short upward chirp
+  osc.frequency.setValueAtTime(420, t);
+  osc.frequency.exponentialRampToValueAtTime(900, t + 0.07);
+  gain.gain.setValueAtTime(0.0001, t);
+  gain.gain.exponentialRampToValueAtTime(0.18, t + 0.005);
+  gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.08);
+  osc.connect(gain).connect(audioCtx.destination);
+  osc.start(t);
+  osc.stop(t + 0.1);
+}
+
+function playCrashSfx() {
+  if (!audioCtx) return;
+  const t = audioCtx.currentTime;
+  // Noise burst via a buffer of random samples
+  const buf = audioCtx.createBuffer(1, audioCtx.sampleRate * 0.35, audioCtx.sampleRate);
+  const data = buf.getChannelData(0);
+  for (let i = 0; i < data.length; i++) {
+    data[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / data.length, 2);
+  }
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  // Lowpass for "thud" rather than "static"
+  const filt = audioCtx.createBiquadFilter();
+  filt.type = 'lowpass';
+  filt.frequency.setValueAtTime(800, t);
+  filt.frequency.exponentialRampToValueAtTime(120, t + 0.3);
+  const gain = audioCtx.createGain();
+  gain.gain.setValueAtTime(0.6, t);
+  gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.35);
+  src.connect(filt).connect(gain).connect(audioCtx.destination);
+  src.start(t);
+}
 
 // =============================================================
 // CANVAS
@@ -256,6 +344,7 @@ function reset() {
   document.getElementById('overlayStart').classList.add('hidden');
   document.getElementById('overlayDead').classList.add('hidden');
   document.getElementById('restartBtn').style.visibility = 'hidden';
+  startMusic();
 }
 
 // requestJump — does NOT directly mutate physics. It sets the jump buffer and
@@ -284,6 +373,8 @@ function die() {
   document.getElementById('deadScore').textContent = `Score ${state.score} · Best ${state.best}`;
   document.getElementById('overlayDead').classList.remove('hidden');
   document.getElementById('restartBtn').style.visibility = 'visible';
+  playCrashSfx();
+  stopMusic();
   for (let i = 0; i < 28; i++) {
     state.particles.push({
       x: CFG.playerX + CFG.playerSize / 2,
@@ -304,23 +395,32 @@ function die() {
 const SPIKE = (offsetBlocks)             => ({ type: 'spike', offset: offsetBlocks, w: 1.0, h: 1.0 });
 const TALL  = (offsetBlocks, h = 1.6)    => ({ type: 'tall',  offset: offsetBlocks, w: 0.85, h });
 
-// Every pattern below is a SINGLE-JUMP cluster. The right edge of the last
-// part (offset + width) must be ≤ MAX_CLUSTER_BLOCKS so it's clearable in one
-// arc. Hard patterns are made by SEQUENCING two clusters with a guaranteed
-// landing zone between them — see scheduleSequence().
+// Every pattern is a SINGLE-JUMP cluster (cleared in one arc). `restBeats` is
+// the gap to the NEXT pattern, expressed in musical beats — so spawns land on
+// the beat of the music. We pick whole-beat or half-beat values to feel rhythmic.
+//
+// One beat at 130 BPM = 0.462s. At 9.5 blocks/s scroll, 1 beat = 4.39 blocks
+// of travel. So a `restBeats: 1` is ~4.4 blocks (just above MIN_REST 4.6 — we
+// validate at load).
 const PATTERNS = [
   // EASY — single jumps with breathing room
-  { name: 'single',         minDifficulty: 0.00, parts: [SPIKE(0)],                          restBlocks: 5.0 },
-  { name: 'single-wide',    minDifficulty: 0.00, parts: [SPIKE(0)],                          restBlocks: 6.5 },
-  { name: 'tall-solo',      minDifficulty: 0.10, parts: [TALL(0, 1.8)],                      restBlocks: 5.5 },
+  { name: 'single',          minDifficulty: 0.00, parts: [SPIKE(0)],                          restBeats: 2.0 },
+  { name: 'single-wide',     minDifficulty: 0.00, parts: [SPIKE(0)],                          restBeats: 1.5 },
+  { name: 'tall-solo',       minDifficulty: 0.10, parts: [TALL(0, 1.8)],                      restBeats: 2.0 },
   // MEDIUM — tight clusters, still one jump
-  { name: 'double-touching',minDifficulty: 0.20, parts: [SPIKE(0), SPIKE(0.85)],             restBlocks: 5.0 },
-  { name: 'spike-tall',     minDifficulty: 0.35, parts: [SPIKE(0), TALL(1.0, 1.6)],          restBlocks: 5.5 },
-  { name: 'tall-spike',     minDifficulty: 0.45, parts: [TALL(0, 1.6), SPIKE(1.0)],          restBlocks: 5.5 },
+  { name: 'double-touching', minDifficulty: 0.20, parts: [SPIKE(0), SPIKE(0.85)],             restBeats: 1.5 },
+  { name: 'spike-tall',      minDifficulty: 0.35, parts: [SPIKE(0), TALL(1.0, 1.6)],          restBeats: 1.5 },
+  { name: 'tall-spike',      minDifficulty: 0.45, parts: [TALL(0, 1.6), SPIKE(1.0)],          restBeats: 1.5 },
 ];
+
+// Convert beats to pixels: pixels per beat = scrollSpeed * (60 / BPM)
+function beatsToPx(beats) {
+  return beats * CFG.scrollSpeed * (60 / CFG.musicBpm);
+}
 
 // Sanity check at load: warn if any pattern exceeds single-jump clearance.
 (function validatePatterns() {
+  const minRestPx = MIN_REST_BLOCKS * BLOCK_PX;
   for (const p of PATTERNS) {
     let maxRight = 0;
     for (const part of p.parts) {
@@ -329,8 +429,9 @@ const PATTERNS = [
     if (maxRight > MAX_CLUSTER_BLOCKS) {
       console.warn(`Pattern "${p.name}" width ${maxRight.toFixed(2)} > MAX_CLUSTER ${MAX_CLUSTER_BLOCKS.toFixed(2)} — UNCLEARABLE`);
     }
-    if (p.restBlocks < MIN_REST_BLOCKS) {
-      console.warn(`Pattern "${p.name}" rest ${p.restBlocks} < MIN_REST ${MIN_REST_BLOCKS.toFixed(2)} — too tight`);
+    const restPx = beatsToPx(p.restBeats);
+    if (restPx < minRestPx) {
+      console.warn(`Pattern "${p.name}" rest ${p.restBeats} beats = ${restPx.toFixed(0)}px < MIN_REST ${minRestPx.toFixed(0)}px — too tight`);
     }
   }
 })();
@@ -372,18 +473,17 @@ function placePattern(originX, pattern) {
 }
 
 function spawnObstacles() {
-  // Difficulty ramps over the first 80s, then plateaus. Easier first run.
   const difficulty = Math.min(1, state.elapsed / 80);
   const spawnWindow = state.cameraX + W + 200;
+  const minRestPx = MIN_REST_BLOCKS * BLOCK_PX;
   while (state.nextSpawnX < spawnWindow) {
-    // First three patterns guaranteed easy + wide so the player can settle.
     const useEasy = state.patternsPlaced < 3;
     const p = useEasy ? PATTERNS[1] : pickPattern(difficulty);
     const rightEdge = placePattern(state.nextSpawnX, p);
-    // Rest is at minimum MIN_REST_BLOCKS — never shrink below clearance math.
-    // Difficulty only adds variation on top, never makes it impossible.
-    const restBlocks = Math.max(MIN_REST_BLOCKS, p.restBlocks - difficulty * 0.5);
-    state.nextSpawnX = rightEdge + restBlocks * BLOCK_PX;
+    // Beat-locked spacing: gap to next pattern equals N beats of camera scroll.
+    // Never shrink below physical clearance minimum.
+    const restPx = Math.max(minRestPx, beatsToPx(p.restBeats));
+    state.nextSpawnX = rightEdge + restPx;
     state.patternsPlaced += 1;
   }
 }
@@ -411,6 +511,7 @@ function step(dt) {
     state.onGround = false;
     state.coyoteRemaining = 0;
     state.jumpBufferRemaining = 0;
+    playJumpSfx();
   }
 
   const wasOnGround = state.onGround;
@@ -559,6 +660,7 @@ function loop(now) {
 requestAnimationFrame(loop);
 
 document.addEventListener('pointerdown', (e) => {
+  initAudio();    // first user gesture — unlocks audio on iOS
   if (e.target.closest('.pill')) return;
   requestJump();
 });
@@ -607,7 +709,6 @@ async function initGestureRecognizer() {
 async function startGestureMode() {
   try {
     if (!gestureRecognizer) await initGestureRecognizer();
-
     videoStream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: 'user', width: 320, height: 240 },
       audio: false,
@@ -615,14 +716,11 @@ async function startGestureMode() {
     camVideo.srcObject = videoStream;
     await camVideo.play();
     camWrap.classList.add('active');
-
     camOverlay.width = camVideo.videoWidth || 320;
     camOverlay.height = camVideo.videoHeight || 240;
-
     gestureModeOn = true;
     toggleBtn.textContent = 'GESTURE ON';
     toggleBtn.classList.add('on');
-
     runRecognitionLoop();
   } catch (err) {
     console.error(err);
@@ -647,6 +745,7 @@ function stopGestureMode() {
 
 toggleBtn.addEventListener('click', (e) => {
   e.stopPropagation();
+  initAudio();
   if (gestureModeOn) stopGestureMode();
   else startGestureMode();
 });
@@ -668,21 +767,8 @@ function runRecognitionLoop() {
   recognitionLoopId = requestAnimationFrame(tick);
 }
 
-// Gesture handling: ANY "jump-like" gesture (fist, fist-with-finger-out,
-// peace sign, thumbs up) triggers a jump while held, on a cooldown. This is
-// way more forgiving than the old "open → fist transition" rule and matches
-// the user's mental model: "while my hand is making a jump shape, the cube
-// jumps repeatedly."
-//
-// Note about death lockout: requestJump() itself enforces the deathLockout,
-// so even if a fist is held when you die, no auto-restart happens until the
-// 800ms lockout has elapsed.
 const JUMP_GESTURES = new Set([
-  'Closed_Fist',
-  'Pointing_Up',     // index finger up — works as fist-with-finger
-  'Victory',         // two fingers up
-  'Thumb_Up',        // thumbs up
-  'ILoveYou',        // pinky+index+thumb extended — partial fist
+  'Closed_Fist', 'Pointing_Up', 'Victory', 'Thumb_Up', 'ILoveYou',
 ]);
 
 function handleResult(result) {

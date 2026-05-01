@@ -4,9 +4,27 @@ A Geometry Dash-style auto-runner where you close your fist in front of your pho
 
 ## What you have
 
-`index.html` is the entire game — one self-contained file, ~600 lines. Open it on your iPhone or iPad in Safari, tap **GESTURE ON**, allow camera, close your fist to jump.
+`index.html` is the entire game — one self-contained file. Open it on your iPhone or iPad in Safari, tap **GESTURE ON**, allow camera, close your fist to jump.
 
-Touch still works as a fallback — tap anywhere to jump.
+Touch still works as a fallback — tap anywhere to jump. Jump SFX and crash SFX are synthesized in-browser, no audio files needed for those.
+
+## Adding music — required for the rhythm feel
+
+The obstacle spawn cadence is **locked to the music's BPM**, so jumps land on the beat. The game expects a file at `audio/track.mp3` relative to `index.html`. Without that file, the game still runs silently — but the rhythm hook is missing.
+
+### Quickest path (5 minutes)
+
+1. Open https://pixabay.com/music/search/130%20bpm/ in your browser. Pixabay is free for commercial use, no attribution required.
+2. Find a driving electronic / EDM / synthwave track at 130 BPM that you like. Click it, then click **Download → MP3** (free Pixabay account may be required).
+3. In `C:\dev\Dashwithmotion`, create a folder called `audio` and save the file as `track.mp3` inside it.
+4. If your track is at a different BPM, open `index.html` and find `musicBpm: 130` near the top of the `<script>` block, change to your track's actual BPM. This re-tunes obstacle spawning to your song.
+5. `git add audio/track.mp3` and push. Refresh the URL on your phone.
+
+If you'd rather not use Pixabay, any royalty-free electronic track from [Free Music Archive](https://freemusicarchive.org/genre/Electronic/) or [incompetech.com](https://incompetech.com) works the same way. CC-BY tracks need a credit line in the README; CC0 / Pixabay don't.
+
+### Why this isn't auto-bundled
+
+Hosting an MP3 in this repo would mean shipping a copy of someone else's audio with no chain of attribution. Better to grab one yourself and document where it came from.
 
 ## Why one HTML file
 

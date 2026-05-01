@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<title>Dash With Motion</title>
+<style>
+  :root {
+    --bg: #0b0d12;
+    --player: #ffd166;
+    --spike: #ff5d73;
+    --tall: #c77dff;
+    --ground: #7ee787;
+    --text: #ffffff;
+    --muted: #9aa0a6;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    width: 100%; height: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", system-ui, sans-serif;
+    overflow: hidden;
+    overscroll-behavior: none;
+    touch-action: manipulation;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  #app { position: fixed; inset: 0; display: block; }
+  canvas#stage {
+    position: absolute; inset: 0;
+    width: 100%; height: 100%;
+    display: block;
+    background: var(--bg);
+  }
+  #hud {
+    position: absolute; top: env(safe-area-inset-top, 14px); left: 16px;
+    pointer-events: none;
+    z-index: 10;
+  }
+  #score { font-size: 32px; font-weight: 800; letter-spacing: 3px; text-shadow: 0 2px 8px rgba(0,0,0,.5); }
+  #best { font-size: 11px; letter-spacing: 2px; color: var(--muted); margin-top: 2px; }
+
+  #camWrap {
+    position: absolute;
+    top: env(safe-area-inset-top, 12px); right: 12px;
+    width: 120px; height: 90px;
+    border-radius: 12px;
+    overflow: hidden;
+    border: 1px solid rgba(255,255,255,.25);
+    background: #000;
+    z-index: 10;
+    transform: scaleX(-1);
+    display: none;
+  }
+  #camWrap.active { display: block; }
+  #camVideo, #camOverlay {
+    position: absolute; inset: 0;
+    width: 100%; height: 100%;
+    object-fit: cover;
+  }
+  #gestureLabel {
+    position: absolute; bottom: 4px; left: 0; right: 0;
+    text-align: center;
+    font-size: 10px; letter-spacing: 1px;
+    color: #fff; text-shadow: 0 1px 2px #000;
+    transform: scaleX(-1);
+    pointer-events: none;
+  }
+
+  #controls {
+    position: absolute;
+    bottom: calc(env(safe-area-inset-bottom, 16px) + 14px);
+    left: 16px; right: 16px;
+    display: flex; justify-content: space-between; align-items: center;
+    z-index: 10;
+    pointer-events: none;
+  }
+  .pill {
+    pointer-events: auto;
+    padding: 10px 14px;
+    border-radius: 20px;
+    background: rgba(255,255,255,.08);
+    border: 1px solid rgba(255,255,255,.15);
+    font-size: 11px; letter-spacing: 1.5px;
+    color: #fff;
+  }
+  .pill.on { background: rgba(126,231,135,.18); border-color: var(--ground); }
+  .pill.warn { background: rgba(255,93,115,.18); border-color: var(--spike); }
+
+  .overlay {
+    position: absolute; inset: 0;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    text-align: center; padding: 20px;
+    z-index: 5;
+    pointer-events: none;
+  }
+  .overlay h1 { font-size: 36px; font-weight: 800; letter-spacing: 5px; }
+  .overlay p { color: var(--muted); margin-top: 10px; font-size: 13px; letter-spacing: 1.5px; }
+  .overlay.hidden { display: none; }
+</style>
+</head>
+<body>
+<div id="app">
+  <canvas id="stage"></canvas>
+
+  <div id="hud">
+    <div id="score">0</div>
+    <div id="best">BEST 0</div>
+  </div>
+
+  <div id="camWrap">
+    <video id="camVideo" autoplay playsinline muted></video>
+    <canvas id="camOverlay"></canvas>
+    <div id="gestureLabel">—</div>
+  </div>
+
+  <div id="controls">
+    <button id="gestureToggle" class="pill">GESTURE OFF</button>
+    <button id="restartBtn" class="pill" style="visibility:hidden">RESTART</button>
+  </div>
+
+  <div id="overlayStart" class="overlay">
+    <h1>DASH WITH MOTION</h1>
+    <p>Tap anywhere to start</p>
+    <p style="margin-top:6px">Or enable gesture mode and close your fist to jump</p>
+  </div>
+
+  <div id="overlayDead" class="overlay hidden">
+    <h1>CRASH</h1>
+    <p id="deadScore">Score 0</p>
+    <p>Tap to retry</p>
+  </div>
+</div>
+
+<script type="module">
+import { GestureRecognizer, FilesetResolver } from
+  "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const CFG = {
+  gravity: 2400,
+  jumpVelocity: -880,
+  scrollSpeed: 380,
+  playerSize: 38,
+  playerX: 110,
+  groundOffset: 110,
+  bpm: 132,
+  jumpDebounceMs: 220,
+};
+
+const stage = document.getElementById('stage');
+const ctx = stage.getContext('2d');
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth;
+  H = window.innerHeight;
+  stage.width = W * DPR;
+  stage.height = H * DPR;
+  stage.style.width = W + 'px';
+  stage.style.height = H + 'px';
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+window.addEventListener('resize', resize);
+window.addEventListener('orientationchange', () => setTimeout(resize, 100));
+resize();
+
+const beatS = 60 / CFG.bpm;
+let nextObstacleId = 1;
+const state = {
+  running: false,
+  dead: false,
+  playerY: 0,
+  velY: 0,
+  onGround: true,
+  cameraX: 0,
+  obstacles: [],
+  elapsed: 0,
+  nextBeat: beatS,
+  beatIndex: 0,
+  score: 0,
+  best: Number(localStorage.getItem('dwm_best') || 0),
+  particles: [],
+};
+
+function groundY() { return H - CFG.groundOffset; }
+
+function reset() {
+  state.running = true;
+  state.dead = false;
+  state.playerY = 0;
+  state.velY = 0;
+  state.onGround = true;
+  state.cameraX = 0;
+  state.obstacles = [];
+  state.elapsed = 0;
+  state.nextBeat = beatS;
+  state.beatIndex = 0;
+  state.score = 0;
+  state.particles = [];
+  document.getElementById('overlayStart').classList.add('hidden');
+  document.getElementById('overlayDead').classList.add('hidden');
+  document.getElementById('restartBtn').style.visibility = 'hidden';
+}
+
+function jump() {
+  if (state.dead) { reset(); return; }
+  if (!state.running) { reset(); return; }
+  if (state.onGround) {
+    state.velY = CFG.jumpVelocity;
+    state.onGround = false;
+  }
+}
+
+function die() {
+  state.running = false;
+  state.dead = true;
+  state.best = Math.max(state.best, state.score);
+  localStorage.setItem('dwm_best', state.best);
+  document.getElementById('deadScore').textContent = `Score ${state.score} · Best ${state.best}`;
+  document.getElementById('overlayDead').classList.remove('hidden');
+  document.getElementById('restartBtn').style.visibility = 'visible';
+  for (let i = 0; i < 24; i++) {
+    state.particles.push({
+      x: CFG.playerX + CFG.playerSize / 2,
+      y: groundY() + state.playerY + CFG.playerSize / 2,
+      vx: (Math.random() - 0.5) * 600,
+      vy: (Math.random() - 1) * 500,
+      life: 0.8,
+    });
+  }
+}
+
+function makeObstacle(worldX, type) {
+  if (type === 'tall') return { id: nextObstacleId++, worldX, type, w: 28, h: 78 };
+  if (type === 'double') return { id: nextObstacleId++, worldX, type, w: 70, h: 36 };
+  return { id: nextObstacleId++, worldX, type: 'spike', w: 36, h: 36 };
+}
+
+function spawnObstaclesIfBeat(dt) {
+  state.elapsed += dt;
+  while (state.elapsed >= state.nextBeat) {
+    state.beatIndex += 1;
+    state.nextBeat += beatS;
+    const beat = state.beatIndex;
+    if (beat < 4) continue;
+
+    const difficulty = Math.min(1, state.elapsed / 50);
+    const spawnChance = 0.32 + difficulty * 0.38;
+    if (Math.random() > spawnChance) continue;
+
+    const spawnX = state.cameraX + W + 60;
+    const last = state.obstacles[state.obstacles.length - 1];
+    if (last && spawnX - last.worldX < 130) continue;
+
+    const r = Math.random();
+    let type = 'spike';
+    if (r > 0.88 && difficulty > 0.25) type = 'tall';
+    else if (r > 0.75 && difficulty > 0.15) type = 'double';
+    state.obstacles.push(makeObstacle(spawnX, type));
+  }
+}
+
+function step(dt) {
+  if (!state.running) return;
+
+  state.velY += CFG.gravity * dt;
+  state.playerY += state.velY * dt;
+  if (state.playerY >= 0) {
+    state.playerY = 0;
+    state.velY = 0;
+    state.onGround = true;
+  }
+
+  state.cameraX += CFG.scrollSpeed * dt;
+  spawnObstaclesIfBeat(dt);
+
+  state.obstacles = state.obstacles.filter(o => o.worldX + o.w > state.cameraX - 60);
+
+  const pLeft = state.cameraX + CFG.playerX + 4;
+  const pRight = pLeft + CFG.playerSize - 8;
+  const pTop = groundY() + state.playerY + 4;
+  const pBottom = groundY() + state.playerY + CFG.playerSize - 4;
+
+  for (const o of state.obstacles) {
+    const oLeft = o.worldX;
+    const oRight = o.worldX + o.w;
+    const oTop = groundY() + CFG.playerSize - o.h;
+    const oBottom = groundY() + CFG.playerSize;
+    if (pRight > oLeft && pLeft < oRight && pBottom > oTop && pTop < oBottom) {
+      die();
+      return;
+    }
+  }
+
+  state.score = Math.floor(state.cameraX / 10);
+
+  for (const p of state.particles) {
+    p.vy += 1400 * dt;
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.life -= dt;
+  }
+  state.particles = state.particles.filter(p => p.life > 0);
+}
+
+function render() {
+  ctx.fillStyle = '#0b0d12';
+  ctx.fillRect(0, 0, W, H);
+
+  const tileW = 56;
+  const offset = (state.cameraX * 0.3) % tileW;
+  for (let i = -1; i < Math.ceil(W / tileW) + 1; i++) {
+    const x = i * tileW - offset;
+    const seed = Math.floor((state.cameraX * 0.3) / tileW) + i;
+    const h = 36 + (Math.abs(Math.sin(seed * 12.9898) * 43758.5453) % 70);
+    ctx.fillStyle = '#1b2030';
+    ctx.fillRect(x, groundY() + CFG.playerSize - h, tileW - 4, h);
+  }
+
+  ctx.fillStyle = '#7ee787';
+  ctx.fillRect(0, groundY() + CFG.playerSize, W, 2);
+
+  for (const o of state.obstacles) {
+    const sx = o.worldX - state.cameraX;
+    if (sx < -80 || sx > W + 20) continue;
+    const top = groundY() + CFG.playerSize - o.h;
+    if (o.type === 'tall') {
+      ctx.fillStyle = '#c77dff';
+      ctx.fillRect(sx, top, o.w, o.h);
+    } else if (o.type === 'double') {
+      ctx.fillStyle = '#ff5d73';
+      drawSpike(sx, groundY() + CFG.playerSize, 32, 32);
+      drawSpike(sx + 38, groundY() + CFG.playerSize, 32, 32);
+    } else {
+      ctx.fillStyle = '#ff5d73';
+      drawSpike(sx, groundY() + CFG.playerSize, o.w, o.h);
+    }
+  }
+
+  const px = CFG.playerX + CFG.playerSize / 2;
+  const py = groundY() + state.playerY + CFG.playerSize / 2;
+  const rot = (state.cameraX * 0.012) % (Math.PI * 2);
+  ctx.save();
+  ctx.translate(px, py);
+  ctx.rotate(rot);
+  ctx.shadowColor = '#ffd166';
+  ctx.shadowBlur = 12;
+  ctx.fillStyle = '#ffd166';
+  ctx.fillRect(-CFG.playerSize / 2, -CFG.playerSize / 2, CFG.playerSize, CFG.playerSize);
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = 'rgba(0,0,0,0.15)';
+  ctx.fillRect(-CFG.playerSize / 2 + 6, -CFG.playerSize / 2 + 6, CFG.playerSize - 12, CFG.playerSize - 12);
+  ctx.restore();
+
+  for (const p of state.particles) {
+    ctx.globalAlpha = Math.max(0, p.life);
+    ctx.fillStyle = '#ffd166';
+    ctx.fillRect(p.x - 3, p.y - 3, 6, 6);
+  }
+  ctx.globalAlpha = 1;
+
+  document.getElementById('score').textContent = state.score;
+  document.getElementById('best').textContent = `BEST ${Math.max(state.best, state.score)}`;
+}
+
+function drawSpike(x, baseY, w, h) {
+  ctx.beginPath();
+  ctx.moveTo(x, baseY);
+  ctx.lineTo(x + w / 2, baseY - h);
+  ctx.lineTo(x + w, baseY);
+  ctx.closePath();
+  ctx.fill();
+}
+
+let last = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - last) / 1000);
+  last = now;
+  step(dt);
+  render();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+document.addEventListener('pointerdown', (e) => {
+  if (e.target.closest('.pill')) return;
+  jump();
+});
+document.getElementById('restartBtn').addEventListener('click', (e) => {
+  e.stopPropagation();
+  reset();
+});
+
+const camWrap = document.getElementById('camWrap');
+const camVideo = document.getElementById('camVideo');
+const camOverlay = document.getElementById('camOverlay');
+const camOverlayCtx = camOverlay.getContext('2d');
+const gestureLabel = document.getElementById('gestureLabel');
+const toggleBtn = document.getElementById('gestureToggle');
+
+let gestureRecognizer = null;
+let gestureModeOn = false;
+let videoStream = null;
+let lastFistAt = 0;
+let recognitionLoopId = null;
+
+async function initGestureRecognizer() {
+  toggleBtn.textContent = 'LOADING...';
+  toggleBtn.classList.add('warn');
+  const vision = await FilesetResolver.forVisionTasks(
+    'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm'
+  );
+  gestureRecognizer = await GestureRecognizer.createFromOptions(vision, {
+    baseOptions: {
+      modelAssetPath:
+        'https://storage.googleapis.com/mediapipe-tasks/gesture_recognizer/gesture_recognizer.task',
+      delegate: 'GPU',
+    },
+    runningMode: 'VIDEO',
+    numHands: 1,
+  });
+  toggleBtn.classList.remove('warn');
+}
+
+async function startGestureMode() {
+  try {
+    if (!gestureRecognizer) await initGestureRecognizer();
+
+    videoStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'user', width: 320, height: 240 },
+      audio: false,
+    });
+    camVideo.srcObject = videoStream;
+    await camVideo.play();
+    camWrap.classList.add('active');
+
+    camOverlay.width = camVideo.videoWidth || 320;
+    camOverlay.height = camVideo.videoHeight || 240;
+
+    gestureModeOn = true;
+    toggleBtn.textContent = 'GESTURE ON';
+    toggleBtn.classList.add('on');
+
+    runRecognitionLoop();
+  } catch (err) {
+    console.error(err);
+    toggleBtn.textContent = 'GESTURE OFF';
+    toggleBtn.classList.remove('on');
+    alert('Camera permission denied or model failed to load: ' + err.message);
+  }
+}
+
+function stopGestureMode() {
+  gestureModeOn = false;
+  if (recognitionLoopId) cancelAnimationFrame(recognitionLoopId);
+  if (videoStream) {
+    videoStream.getTracks().forEach((t) => t.stop());
+    videoStream = null;
+  }
+  camWrap.classList.remove('active');
+  toggleBtn.textContent = 'GESTURE OFF';
+  toggleBtn.classList.remove('on');
+  gestureLabel.textContent = '—';
+}
+
+toggleBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  if (gestureModeOn) stopGestureMode();
+  else startGestureMode();
+});
+
+function runRecognitionLoop() {
+  let lastVideoTime = -1;
+  const tick = () => {
+    if (!gestureModeOn) return;
+    if (camVideo.readyState >= 2 && camVideo.currentTime !== lastVideoTime) {
+      lastVideoTime = camVideo.currentTime;
+      try {
+        const result = gestureRecognizer.recognizeForVideo(camVideo, performance.now());
+        handleResult(result);
+        drawHandLandmarks(result);
+      } catch (e) { /* model warming up */ }
+    }
+    recognitionLoopId = requestAnimationFrame(tick);
+  };
+  recognitionLoopId = requestAnimationFrame(tick);
+}
+
+function handleResult(result) {
+  if (!result?.gestures || !result.gestures.length) {
+    gestureLabel.textContent = '—';
+    return;
+  }
+  const top = result.gestures[0][0];
+  gestureLabel.textContent = `${top.categoryName} ${(top.score * 100).toFixed(0)}%`;
+
+  const now = performance.now();
+  if (top.categoryName === 'Closed_Fist' && top.score > 0.6) {
+    if (now - lastFistAt > CFG.jumpDebounceMs) {
+      jump();
+    }
+    lastFistAt = now;
+  } else {
+    if (now - lastFistAt > 80) lastFistAt = 0;
+  }
+}
+
+function drawHandLandmarks(result) {
+  const c = camOverlayCtx;
+  c.clearRect(0, 0, camOverlay.width, camOverlay.height);
+  if (!result?.landmarks?.length) return;
+  c.fillStyle = '#7ee787';
+  for (const hand of result.landmarks) {
+    for (const lm of hand) {
+      const x = lm.x * camOverlay.width;
+      const y = lm.y * camOverlay.height;
+      c.beginPath();
+      c.arc(x, y, 3, 0, Math.PI * 2);
+      c.fill();
+    }
+  }
+}
+</script>
+</body>
+</html>

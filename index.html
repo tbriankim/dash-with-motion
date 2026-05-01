@@ -141,17 +141,42 @@
 import { GestureRecognizer, FilesetResolver } from
   "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
 
+// =============================================================
+// PHYSICS — Geometry Dash-derived
+// =============================================================
+// In GD, the cube jumps 2 blocks high, full arc takes ~0.6s, scroll is
+// 11.2 blocks/s at "1x" speed. We keep a virtual block unit so the game
+// scales with screen size.
+const BLOCK_PX = 42;
+const JUMP_HEIGHT_BLOCKS = 2.0;
+const JUMP_ARC_S = 0.62;
+const _h = JUMP_HEIGHT_BLOCKS * BLOCK_PX;
+const _g = (8 * _h) / (JUMP_ARC_S * JUMP_ARC_S);   // ~3500 px/s²
+const _v0 = -(4 * _h) / JUMP_ARC_S;                // ~-1083 px/s
+
 const CFG = {
-  gravity: 2400,
-  jumpVelocity: -880,
-  scrollSpeed: 380,
-  playerSize: 38,
-  playerX: 110,
+  // physics
+  gravity: _g,
+  jumpVelocity: _v0,
+  scrollSpeed: 11.2 * BLOCK_PX,        // ~470 px/s
+  // player
+  playerSize: BLOCK_PX,
+  playerX: 140,
   groundOffset: 110,
-  bpm: 132,
-  jumpDebounceMs: 220,
+  // input forgiveness
+  coyoteTimeS: 0.08,                   // 80ms after walking off ground, jump still counts
+  jumpBufferS: 0.12,                   // 120ms before landing, jump press is queued
+  jumpDebounceMs: 180,
+  // death lockout — ignore inputs after dying so the killing fist doesn't auto-restart
+  deathLockoutMs: 700,
+  // gesture confidence
+  fistConfidence: 0.55,
+  openHandConfidence: 0.55,
 };
 
+// =============================================================
+// CANVAS
+// =============================================================
 const stage = document.getElementById('stage');
 const ctx = stage.getContext('2d');
 let W = 0, H = 0, DPR = 1;
@@ -170,19 +195,24 @@ window.addEventListener('resize', resize);
 window.addEventListener('orientationchange', () => setTimeout(resize, 100));
 resize();
 
-const beatS = 60 / CFG.bpm;
+// =============================================================
+// STATE
+// =============================================================
 let nextObstacleId = 1;
 const state = {
   running: false,
   dead: false,
+  deadAt: 0,
   playerY: 0,
   velY: 0,
   onGround: true,
   cameraX: 0,
   obstacles: [],
   elapsed: 0,
-  nextBeat: beatS,
-  beatIndex: 0,
+  coyoteRemaining: 0,
+  jumpBufferRemaining: 0,
+  nextSpawnX: 0,
+  patternsPlaced: 0,
   score: 0,
   best: Number(localStorage.getItem('dwm_best') || 0),
   particles: [],
@@ -193,14 +223,17 @@ function groundY() { return H - CFG.groundOffset; }
 function reset() {
   state.running = true;
   state.dead = false;
+  state.deadAt = 0;
   state.playerY = 0;
   state.velY = 0;
   state.onGround = true;
   state.cameraX = 0;
   state.obstacles = [];
   state.elapsed = 0;
-  state.nextBeat = beatS;
-  state.beatIndex = 0;
+  state.coyoteRemaining = 0;
+  state.jumpBufferRemaining = 0;
+  state.nextSpawnX = W + 200;
+  state.patternsPlaced = 0;
   state.score = 0;
   state.particles = [];
   document.getElementById('overlayStart').classList.add('hidden');
@@ -208,84 +241,168 @@ function reset() {
   document.getElementById('restartBtn').style.visibility = 'hidden';
 }
 
-function jump() {
-  if (state.dead) { reset(); return; }
-  if (!state.running) { reset(); return; }
-  if (state.onGround) {
-    state.velY = CFG.jumpVelocity;
-    state.onGround = false;
+// requestJump — does NOT directly mutate physics. It sets the jump buffer and
+// the physics step decides whether to actually jump. This gives us coyote
+// time + input buffering naturally.
+function requestJump() {
+  if (state.dead) {
+    if (performance.now() - state.deadAt < CFG.deathLockoutMs) return;
+    reset();
+    return;
   }
+  if (!state.running) {
+    reset();
+    return;
+  }
+  state.jumpBufferRemaining = CFG.jumpBufferS;
 }
 
 function die() {
+  if (state.dead) return;
   state.running = false;
   state.dead = true;
+  state.deadAt = performance.now();
   state.best = Math.max(state.best, state.score);
   localStorage.setItem('dwm_best', state.best);
   document.getElementById('deadScore').textContent = `Score ${state.score} · Best ${state.best}`;
   document.getElementById('overlayDead').classList.remove('hidden');
   document.getElementById('restartBtn').style.visibility = 'visible';
-  for (let i = 0; i < 24; i++) {
+  for (let i = 0; i < 28; i++) {
     state.particles.push({
       x: CFG.playerX + CFG.playerSize / 2,
       y: groundY() + state.playerY + CFG.playerSize / 2,
-      vx: (Math.random() - 0.5) * 600,
-      vy: (Math.random() - 1) * 500,
-      life: 0.8,
+      vx: (Math.random() - 0.5) * 700,
+      vy: (Math.random() - 1) * 600,
+      life: 0.85,
     });
   }
 }
 
-function makeObstacle(worldX, type) {
-  if (type === 'tall') return { id: nextObstacleId++, worldX, type, w: 28, h: 78 };
-  if (type === 'double') return { id: nextObstacleId++, worldX, type, w: 70, h: 36 };
-  return { id: nextObstacleId++, worldX, type: 'spike', w: 36, h: 36 };
+// =============================================================
+// OBSTACLE PATTERNS
+// =============================================================
+// Each pattern is a list of obstacles at offsets in BLOCK units. After placing,
+// we advance state.nextSpawnX past the pattern's right edge plus a "rest gap"
+// long enough to land and jump again.
+const SPIKE = (offsetBlocks)             => ({ type: 'spike', offset: offsetBlocks, w: 1.0, h: 1.0 });
+const TALL  = (offsetBlocks, h = 1.6)    => ({ type: 'tall',  offset: offsetBlocks, w: 0.85, h });
+
+const PATTERNS = [
+  // EASY — single jumps with breathing room
+  { name: 'single',         minDifficulty: 0.00, parts: [SPIKE(0)],                                   restBlocks: 4.0 },
+  { name: 'single-wide',    minDifficulty: 0.00, parts: [SPIKE(0)],                                   restBlocks: 5.5 },
+  { name: 'tall-solo',      minDifficulty: 0.10, parts: [TALL(0, 1.6)],                               restBlocks: 4.5 },
+  // MEDIUM — back-to-back rhythm
+  { name: 'double',         minDifficulty: 0.20, parts: [SPIKE(0), SPIKE(1)],                         restBlocks: 4.0 },
+  { name: 'spike-then-tall',minDifficulty: 0.25, parts: [SPIKE(0), TALL(2.4, 1.6)],                   restBlocks: 4.5 },
+  { name: 'gap-spike',      minDifficulty: 0.30, parts: [SPIKE(0), SPIKE(2.6)],                       restBlocks: 4.0 },
+  // HARD
+  { name: 'triple',         minDifficulty: 0.45, parts: [SPIKE(0), SPIKE(1), SPIKE(2)],               restBlocks: 4.5 },
+  { name: 'double-double',  minDifficulty: 0.55, parts: [SPIKE(0), SPIKE(1), SPIKE(3.0), SPIKE(4.0)], restBlocks: 4.5 },
+  { name: 'tall-spike-tall',minDifficulty: 0.65, parts: [TALL(0, 1.6), SPIKE(2.4), TALL(4.6, 1.6)],   restBlocks: 5.0 },
+];
+
+function pickPattern(difficulty) {
+  const eligible = PATTERNS.filter(p => p.minDifficulty <= difficulty);
+  // Easy patterns get less weight as difficulty rises so the game ramps up.
+  const weights = eligible.map(p => 1 + difficulty * 1.5 * (p.minDifficulty > 0.2 ? 1 : -0.5));
+  const total = weights.reduce((a, b) => a + Math.max(0.05, b), 0);
+  let r = Math.random() * total;
+  for (let i = 0; i < eligible.length; i++) {
+    r -= Math.max(0.05, weights[i]);
+    if (r <= 0) return eligible[i];
+  }
+  return eligible[0];
 }
 
-function spawnObstaclesIfBeat(dt) {
-  state.elapsed += dt;
-  while (state.elapsed >= state.nextBeat) {
-    state.beatIndex += 1;
-    state.nextBeat += beatS;
-    const beat = state.beatIndex;
-    if (beat < 4) continue;
+function placePattern(originX, pattern) {
+  let maxRight = 0;
+  for (const part of pattern.parts) {
+    const wPx = part.w * BLOCK_PX;
+    const hPx = part.h * BLOCK_PX;
+    const x = originX + part.offset * BLOCK_PX;
+    state.obstacles.push({
+      id: nextObstacleId++,
+      type: part.type,
+      worldX: x,
+      w: wPx,
+      h: hPx,
+    });
+    maxRight = Math.max(maxRight, x + wPx);
+  }
+  return maxRight;
+}
 
-    const difficulty = Math.min(1, state.elapsed / 50);
-    const spawnChance = 0.32 + difficulty * 0.38;
-    if (Math.random() > spawnChance) continue;
-
-    const spawnX = state.cameraX + W + 60;
-    const last = state.obstacles[state.obstacles.length - 1];
-    if (last && spawnX - last.worldX < 130) continue;
-
-    const r = Math.random();
-    let type = 'spike';
-    if (r > 0.88 && difficulty > 0.25) type = 'tall';
-    else if (r > 0.75 && difficulty > 0.15) type = 'double';
-    state.obstacles.push(makeObstacle(spawnX, type));
+function spawnObstacles() {
+  const difficulty = Math.min(1, state.elapsed / 70);
+  const spawnWindow = state.cameraX + W + 200;
+  while (state.nextSpawnX < spawnWindow) {
+    // First two patterns are guaranteed easy so the player has time to settle.
+    const useEasy = state.patternsPlaced < 2;
+    const p = useEasy ? PATTERNS[0] : pickPattern(difficulty);
+    const rightEdge = placePattern(state.nextSpawnX, p);
+    // Higher difficulty → tighter rest gaps (max ~25% reduction)
+    const restPx = p.restBlocks * BLOCK_PX * (1 - difficulty * 0.25);
+    state.nextSpawnX = rightEdge + restPx;
+    state.patternsPlaced += 1;
   }
 }
 
+// =============================================================
+// PHYSICS STEP
+// =============================================================
 function step(dt) {
-  if (!state.running) return;
+  if (!state.running) {
+    // Particles still animate after death so the burst plays out
+    updateParticles(dt);
+    return;
+  }
+  state.elapsed += dt;
 
+  // Drain forgiveness timers
+  state.coyoteRemaining = Math.max(0, state.coyoteRemaining - dt);
+  state.jumpBufferRemaining = Math.max(0, state.jumpBufferRemaining - dt);
+
+  // If a jump press is buffered AND we're either grounded or within coyote
+  // window, fire the jump.
+  const canJump = state.onGround || state.coyoteRemaining > 0;
+  if (state.jumpBufferRemaining > 0 && canJump) {
+    state.velY = CFG.jumpVelocity;
+    state.onGround = false;
+    state.coyoteRemaining = 0;
+    state.jumpBufferRemaining = 0;
+  }
+
+  const wasOnGround = state.onGround;
+
+  // Gravity + integrate
   state.velY += CFG.gravity * dt;
   state.playerY += state.velY * dt;
   if (state.playerY >= 0) {
     state.playerY = 0;
     state.velY = 0;
     state.onGround = true;
+  } else {
+    state.onGround = false;
+  }
+  // Just walked off a ledge (or just left top of jump): start coyote window
+  if (wasOnGround && !state.onGround && state.velY > 0) {
+    state.coyoteRemaining = CFG.coyoteTimeS;
   }
 
+  // Scroll world
   state.cameraX += CFG.scrollSpeed * dt;
-  spawnObstaclesIfBeat(dt);
+  spawnObstacles();
 
-  state.obstacles = state.obstacles.filter(o => o.worldX + o.w > state.cameraX - 60);
+  // Cull obstacles behind camera
+  state.obstacles = state.obstacles.filter(o => o.worldX + o.w > state.cameraX - 80);
 
-  const pLeft = state.cameraX + CFG.playerX + 4;
-  const pRight = pLeft + CFG.playerSize - 8;
-  const pTop = groundY() + state.playerY + 4;
-  const pBottom = groundY() + state.playerY + CFG.playerSize - 4;
+  // Collision — slightly forgiving hitbox (12% inset)
+  const inset = CFG.playerSize * 0.12;
+  const pLeft = state.cameraX + CFG.playerX + inset;
+  const pRight = state.cameraX + CFG.playerX + CFG.playerSize - inset;
+  const pTop = groundY() + state.playerY + inset;
+  const pBottom = groundY() + state.playerY + CFG.playerSize - inset;
 
   for (const o of state.obstacles) {
     const oLeft = o.worldX;
@@ -299,7 +416,10 @@ function step(dt) {
   }
 
   state.score = Math.floor(state.cameraX / 10);
+  updateParticles(dt);
+}
 
+function updateParticles(dt) {
   for (const p of state.particles) {
     p.vy += 1400 * dt;
     p.x += p.vx * dt;
@@ -309,10 +429,14 @@ function step(dt) {
   state.particles = state.particles.filter(p => p.life > 0);
 }
 
+// =============================================================
+// RENDER
+// =============================================================
 function render() {
   ctx.fillStyle = '#0b0d12';
   ctx.fillRect(0, 0, W, H);
 
+  // Parallax skyline
   const tileW = 56;
   const offset = (state.cameraX * 0.3) % tileW;
   for (let i = -1; i < Math.ceil(W / tileW) + 1; i++) {
@@ -323,26 +447,27 @@ function render() {
     ctx.fillRect(x, groundY() + CFG.playerSize - h, tileW - 4, h);
   }
 
+  // Ground line
   ctx.fillStyle = '#7ee787';
   ctx.fillRect(0, groundY() + CFG.playerSize, W, 2);
 
+  // Obstacles
   for (const o of state.obstacles) {
     const sx = o.worldX - state.cameraX;
     if (sx < -80 || sx > W + 20) continue;
-    const top = groundY() + CFG.playerSize - o.h;
     if (o.type === 'tall') {
+      const top = groundY() + CFG.playerSize - o.h;
       ctx.fillStyle = '#c77dff';
       ctx.fillRect(sx, top, o.w, o.h);
-    } else if (o.type === 'double') {
-      ctx.fillStyle = '#ff5d73';
-      drawSpike(sx, groundY() + CFG.playerSize, 32, 32);
-      drawSpike(sx + 38, groundY() + CFG.playerSize, 32, 32);
+      ctx.fillStyle = 'rgba(255,255,255,0.18)';
+      ctx.fillRect(sx, top, o.w, 3);
     } else {
       ctx.fillStyle = '#ff5d73';
       drawSpike(sx, groundY() + CFG.playerSize, o.w, o.h);
     }
   }
 
+  // Player (rotating cube)
   const px = CFG.playerX + CFG.playerSize / 2;
   const py = groundY() + state.playerY + CFG.playerSize / 2;
   const rot = (state.cameraX * 0.012) % (Math.PI * 2);
@@ -350,14 +475,15 @@ function render() {
   ctx.translate(px, py);
   ctx.rotate(rot);
   ctx.shadowColor = '#ffd166';
-  ctx.shadowBlur = 12;
+  ctx.shadowBlur = 14;
   ctx.fillStyle = '#ffd166';
   ctx.fillRect(-CFG.playerSize / 2, -CFG.playerSize / 2, CFG.playerSize, CFG.playerSize);
   ctx.shadowBlur = 0;
-  ctx.fillStyle = 'rgba(0,0,0,0.15)';
+  ctx.fillStyle = 'rgba(0,0,0,0.18)';
   ctx.fillRect(-CFG.playerSize / 2 + 6, -CFG.playerSize / 2 + 6, CFG.playerSize - 12, CFG.playerSize - 12);
   ctx.restore();
 
+  // Particles
   for (const p of state.particles) {
     ctx.globalAlpha = Math.max(0, p.life);
     ctx.fillStyle = '#ffd166';
@@ -365,6 +491,7 @@ function render() {
   }
   ctx.globalAlpha = 1;
 
+  // HUD
   document.getElementById('score').textContent = state.score;
   document.getElementById('best').textContent = `BEST ${Math.max(state.best, state.score)}`;
 }
@@ -390,13 +517,19 @@ requestAnimationFrame(loop);
 
 document.addEventListener('pointerdown', (e) => {
   if (e.target.closest('.pill')) return;
-  jump();
+  requestJump();
 });
 document.getElementById('restartBtn').addEventListener('click', (e) => {
   e.stopPropagation();
-  reset();
+  if (state.dead) {
+    if (performance.now() - state.deadAt < CFG.deathLockoutMs) return;
+    reset();
+  }
 });
 
+// =============================================================
+// INPUT — GESTURE (MediaPipe)
+// =============================================================
 const camWrap = document.getElementById('camWrap');
 const camVideo = document.getElementById('camVideo');
 const camOverlay = document.getElementById('camOverlay');
@@ -409,6 +542,7 @@ let gestureModeOn = false;
 let videoStream = null;
 let lastFistAt = 0;
 let recognitionLoopId = null;
+let handState = 'unknown';   // 'open' | 'fist' | 'unknown'
 
 async function initGestureRecognizer() {
   toggleBtn.textContent = 'LOADING...';
@@ -444,6 +578,7 @@ async function startGestureMode() {
     camOverlay.height = camVideo.videoHeight || 240;
 
     gestureModeOn = true;
+    handState = 'unknown';
     toggleBtn.textContent = 'GESTURE ON';
     toggleBtn.classList.add('on');
 
@@ -485,7 +620,7 @@ function runRecognitionLoop() {
         const result = gestureRecognizer.recognizeForVideo(camVideo, performance.now());
         handleResult(result);
         drawHandLandmarks(result);
-      } catch (e) { /* model warming up */ }
+      } catch (e) { /* warming up */ }
     }
     recognitionLoopId = requestAnimationFrame(tick);
   };
@@ -495,19 +630,24 @@ function runRecognitionLoop() {
 function handleResult(result) {
   if (!result?.gestures || !result.gestures.length) {
     gestureLabel.textContent = '—';
+    handState = 'unknown';
     return;
   }
   const top = result.gestures[0][0];
   gestureLabel.textContent = `${top.categoryName} ${(top.score * 100).toFixed(0)}%`;
-
+  const isFist = top.categoryName === 'Closed_Fist' && top.score > CFG.fistConfidence;
+  const isOpen = (top.categoryName === 'Open_Palm' || top.categoryName === 'Pointing_Up' ||
+                  top.categoryName === 'Victory' || top.categoryName === 'Thumb_Up') &&
+                 top.score > CFG.openHandConfidence;
   const now = performance.now();
-  if (top.categoryName === 'Closed_Fist' && top.score > 0.6) {
-    if (now - lastFistAt > CFG.jumpDebounceMs) {
-      jump();
+  if (isFist) {
+    if (handState === 'open' && now - lastFistAt > CFG.jumpDebounceMs) {
+      requestJump();
+      lastFistAt = now;
     }
-    lastFistAt = now;
-  } else {
-    if (now - lastFistAt > 80) lastFistAt = 0;
+    handState = 'fist';
+  } else if (isOpen) {
+    handState = 'open';
   }
 }
 

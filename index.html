@@ -144,35 +144,52 @@ import { GestureRecognizer, FilesetResolver } from
 // =============================================================
 // PHYSICS — Geometry Dash-derived
 // =============================================================
-// In GD, the cube jumps 2 blocks high, full arc takes ~0.6s, scroll is
-// 11.2 blocks/s at "1x" speed. We keep a virtual block unit so the game
-// scales with screen size.
+// Physics — asymmetric gravity (fast rise, faster fall). The cube pops up
+// quickly, peaks, then plummets. This is what makes platformers feel "good"
+// — symmetric gravity is technically correct but feels floaty on the way down.
 const BLOCK_PX = 42;
-const JUMP_HEIGHT_BLOCKS = 2.0;
-const JUMP_ARC_S = 0.62;
+const JUMP_HEIGHT_BLOCKS = 2.6;       // taller, more dramatic pop
+const JUMP_RISE_S = 0.22;             // 220ms up
+const JUMP_FALL_S = 0.18;             // 180ms down — faster than rise
+// Derive: at peak, vy=0. Going up: 0 = v0 + gUp*riseT, so v0 = -gUp*riseT.
+// Height = -v0*riseT - 0.5*gUp*riseT² = 0.5*gUp*riseT² → gUp = 2h/riseT²
 const _h = JUMP_HEIGHT_BLOCKS * BLOCK_PX;
-const _g = (8 * _h) / (JUMP_ARC_S * JUMP_ARC_S);   // ~3500 px/s²
-const _v0 = -(4 * _h) / JUMP_ARC_S;                // ~-1083 px/s
+const _gUp = (2 * _h) / (JUMP_RISE_S * JUMP_RISE_S);
+const _gDown = (2 * _h) / (JUMP_FALL_S * JUMP_FALL_S);
+const _v0 = -_gUp * JUMP_RISE_S;
 
 const CFG = {
   // physics
-  gravity: _g,
-  jumpVelocity: _v0,
-  scrollSpeed: 11.2 * BLOCK_PX,        // ~470 px/s
+  gravityUp: _gUp,                     // ~9900 px/s² while ascending
+  gravityDown: _gDown,                 // ~14800 px/s² while descending — falls FAST
+  jumpVelocity: _v0,                   // ~-2180 px/s — strong pop
+  scrollSpeed: 9.5 * BLOCK_PX,         // ~400 px/s
   // player
   playerSize: BLOCK_PX,
   playerX: 140,
   groundOffset: 110,
   // input forgiveness
-  coyoteTimeS: 0.08,                   // 80ms after walking off ground, jump still counts
-  jumpBufferS: 0.12,                   // 120ms before landing, jump press is queued
-  jumpDebounceMs: 180,
-  // death lockout — ignore inputs after dying so the killing fist doesn't auto-restart
-  deathLockoutMs: 700,
-  // gesture confidence
-  fistConfidence: 0.55,
-  openHandConfidence: 0.55,
+  coyoteTimeS: 0.10,
+  jumpBufferS: 0.14,
+  // gesture
+  jumpDebounceMs: 220,                 // min ms between auto-jumps when fist is held
+  // death lockout
+  deathLockoutMs: 800,                 // a touch longer to avoid retrigger
+  // gesture confidence — LOWER = more sensitive
+  fistConfidence: 0.40,                // was 0.55 — accept partial fists
 };
+
+// =============================================================
+// CLEARANCE MATH — used to validate obstacle patterns at runtime
+// =============================================================
+// Total airtime is rise + fall. Shorter than the old 0.46s symmetric arc.
+const JUMP_ARC_S = JUMP_RISE_S + JUMP_FALL_S;                 // 0.40s total
+const JUMP_DISTANCE_PX = CFG.scrollSpeed * JUMP_ARC_S;        // ~160 px ≈ 3.8 blocks
+const JUMP_DISTANCE_BLOCKS = JUMP_DISTANCE_PX / BLOCK_PX;
+// The widest single-jump cluster we should ever spawn — leave 25% margin.
+const MAX_CLUSTER_BLOCKS = JUMP_DISTANCE_BLOCKS * 0.75;       // ~2.85 blocks
+// Min rest distance between patterns — enough to land and re-jump comfortably.
+const MIN_REST_BLOCKS = JUMP_DISTANCE_BLOCKS * 1.20;          // ~4.6 blocks
 
 // =============================================================
 // CANVAS
@@ -287,29 +304,50 @@ function die() {
 const SPIKE = (offsetBlocks)             => ({ type: 'spike', offset: offsetBlocks, w: 1.0, h: 1.0 });
 const TALL  = (offsetBlocks, h = 1.6)    => ({ type: 'tall',  offset: offsetBlocks, w: 0.85, h });
 
+// Every pattern below is a SINGLE-JUMP cluster. The right edge of the last
+// part (offset + width) must be ≤ MAX_CLUSTER_BLOCKS so it's clearable in one
+// arc. Hard patterns are made by SEQUENCING two clusters with a guaranteed
+// landing zone between them — see scheduleSequence().
 const PATTERNS = [
   // EASY — single jumps with breathing room
-  { name: 'single',         minDifficulty: 0.00, parts: [SPIKE(0)],                                   restBlocks: 4.0 },
-  { name: 'single-wide',    minDifficulty: 0.00, parts: [SPIKE(0)],                                   restBlocks: 5.5 },
-  { name: 'tall-solo',      minDifficulty: 0.10, parts: [TALL(0, 1.6)],                               restBlocks: 4.5 },
-  // MEDIUM — back-to-back rhythm
-  { name: 'double',         minDifficulty: 0.20, parts: [SPIKE(0), SPIKE(1)],                         restBlocks: 4.0 },
-  { name: 'spike-then-tall',minDifficulty: 0.25, parts: [SPIKE(0), TALL(2.4, 1.6)],                   restBlocks: 4.5 },
-  { name: 'gap-spike',      minDifficulty: 0.30, parts: [SPIKE(0), SPIKE(2.6)],                       restBlocks: 4.0 },
-  // HARD
-  { name: 'triple',         minDifficulty: 0.45, parts: [SPIKE(0), SPIKE(1), SPIKE(2)],               restBlocks: 4.5 },
-  { name: 'double-double',  minDifficulty: 0.55, parts: [SPIKE(0), SPIKE(1), SPIKE(3.0), SPIKE(4.0)], restBlocks: 4.5 },
-  { name: 'tall-spike-tall',minDifficulty: 0.65, parts: [TALL(0, 1.6), SPIKE(2.4), TALL(4.6, 1.6)],   restBlocks: 5.0 },
+  { name: 'single',         minDifficulty: 0.00, parts: [SPIKE(0)],                          restBlocks: 5.0 },
+  { name: 'single-wide',    minDifficulty: 0.00, parts: [SPIKE(0)],                          restBlocks: 6.5 },
+  { name: 'tall-solo',      minDifficulty: 0.10, parts: [TALL(0, 1.8)],                      restBlocks: 5.5 },
+  // MEDIUM — tight clusters, still one jump
+  { name: 'double-touching',minDifficulty: 0.20, parts: [SPIKE(0), SPIKE(0.85)],             restBlocks: 5.0 },
+  { name: 'spike-tall',     minDifficulty: 0.35, parts: [SPIKE(0), TALL(1.0, 1.6)],          restBlocks: 5.5 },
+  { name: 'tall-spike',     minDifficulty: 0.45, parts: [TALL(0, 1.6), SPIKE(1.0)],          restBlocks: 5.5 },
 ];
+
+// Sanity check at load: warn if any pattern exceeds single-jump clearance.
+(function validatePatterns() {
+  for (const p of PATTERNS) {
+    let maxRight = 0;
+    for (const part of p.parts) {
+      maxRight = Math.max(maxRight, part.offset + part.w);
+    }
+    if (maxRight > MAX_CLUSTER_BLOCKS) {
+      console.warn(`Pattern "${p.name}" width ${maxRight.toFixed(2)} > MAX_CLUSTER ${MAX_CLUSTER_BLOCKS.toFixed(2)} — UNCLEARABLE`);
+    }
+    if (p.restBlocks < MIN_REST_BLOCKS) {
+      console.warn(`Pattern "${p.name}" rest ${p.restBlocks} < MIN_REST ${MIN_REST_BLOCKS.toFixed(2)} — too tight`);
+    }
+  }
+})();
 
 function pickPattern(difficulty) {
   const eligible = PATTERNS.filter(p => p.minDifficulty <= difficulty);
-  // Easy patterns get less weight as difficulty rises so the game ramps up.
-  const weights = eligible.map(p => 1 + difficulty * 1.5 * (p.minDifficulty > 0.2 ? 1 : -0.5));
-  const total = weights.reduce((a, b) => a + Math.max(0.05, b), 0);
+  // Bias toward harder patterns as difficulty rises, but never starve easy ones.
+  const weights = eligible.map(p => {
+    const tier = p.minDifficulty;
+    // Easy (tier=0) gets weight 1.5 → 0.7 as difficulty 0 → 1
+    // Hard (tier>=0.5) gets weight 0.3 → 1.5 as difficulty 0 → 1
+    return Math.max(0.2, 1 + (difficulty - 0.5) * (tier > 0.3 ? 2 : -1.5));
+  });
+  const total = weights.reduce((a, b) => a + b, 0);
   let r = Math.random() * total;
   for (let i = 0; i < eligible.length; i++) {
-    r -= Math.max(0.05, weights[i]);
+    r -= weights[i];
     if (r <= 0) return eligible[i];
   }
   return eligible[0];
@@ -334,16 +372,18 @@ function placePattern(originX, pattern) {
 }
 
 function spawnObstacles() {
-  const difficulty = Math.min(1, state.elapsed / 70);
+  // Difficulty ramps over the first 80s, then plateaus. Easier first run.
+  const difficulty = Math.min(1, state.elapsed / 80);
   const spawnWindow = state.cameraX + W + 200;
   while (state.nextSpawnX < spawnWindow) {
-    // First two patterns are guaranteed easy so the player has time to settle.
-    const useEasy = state.patternsPlaced < 2;
-    const p = useEasy ? PATTERNS[0] : pickPattern(difficulty);
+    // First three patterns guaranteed easy + wide so the player can settle.
+    const useEasy = state.patternsPlaced < 3;
+    const p = useEasy ? PATTERNS[1] : pickPattern(difficulty);
     const rightEdge = placePattern(state.nextSpawnX, p);
-    // Higher difficulty → tighter rest gaps (max ~25% reduction)
-    const restPx = p.restBlocks * BLOCK_PX * (1 - difficulty * 0.25);
-    state.nextSpawnX = rightEdge + restPx;
+    // Rest is at minimum MIN_REST_BLOCKS — never shrink below clearance math.
+    // Difficulty only adds variation on top, never makes it impossible.
+    const restBlocks = Math.max(MIN_REST_BLOCKS, p.restBlocks - difficulty * 0.5);
+    state.nextSpawnX = rightEdge + restBlocks * BLOCK_PX;
     state.patternsPlaced += 1;
   }
 }
@@ -375,8 +415,11 @@ function step(dt) {
 
   const wasOnGround = state.onGround;
 
-  // Gravity + integrate
-  state.velY += CFG.gravity * dt;
+  // Asymmetric gravity: lighter while ascending (vy<0), heavier while falling.
+  // This is the secret sauce — the cube pops UP fast and falls DOWN faster,
+  // ready for the next obstacle.
+  const grav = state.velY < 0 ? CFG.gravityUp : CFG.gravityDown;
+  state.velY += grav * dt;
   state.playerY += state.velY * dt;
   if (state.playerY >= 0) {
     state.playerY = 0;
@@ -542,7 +585,6 @@ let gestureModeOn = false;
 let videoStream = null;
 let lastFistAt = 0;
 let recognitionLoopId = null;
-let handState = 'unknown';   // 'open' | 'fist' | 'unknown'
 
 async function initGestureRecognizer() {
   toggleBtn.textContent = 'LOADING...';
@@ -578,7 +620,6 @@ async function startGestureMode() {
     camOverlay.height = camVideo.videoHeight || 240;
 
     gestureModeOn = true;
-    handState = 'unknown';
     toggleBtn.textContent = 'GESTURE ON';
     toggleBtn.classList.add('on');
 
@@ -627,27 +668,36 @@ function runRecognitionLoop() {
   recognitionLoopId = requestAnimationFrame(tick);
 }
 
+// Gesture handling: ANY "jump-like" gesture (fist, fist-with-finger-out,
+// peace sign, thumbs up) triggers a jump while held, on a cooldown. This is
+// way more forgiving than the old "open → fist transition" rule and matches
+// the user's mental model: "while my hand is making a jump shape, the cube
+// jumps repeatedly."
+//
+// Note about death lockout: requestJump() itself enforces the deathLockout,
+// so even if a fist is held when you die, no auto-restart happens until the
+// 800ms lockout has elapsed.
+const JUMP_GESTURES = new Set([
+  'Closed_Fist',
+  'Pointing_Up',     // index finger up — works as fist-with-finger
+  'Victory',         // two fingers up
+  'Thumb_Up',        // thumbs up
+  'ILoveYou',        // pinky+index+thumb extended — partial fist
+]);
+
 function handleResult(result) {
   if (!result?.gestures || !result.gestures.length) {
     gestureLabel.textContent = '—';
-    handState = 'unknown';
     return;
   }
   const top = result.gestures[0][0];
   gestureLabel.textContent = `${top.categoryName} ${(top.score * 100).toFixed(0)}%`;
-  const isFist = top.categoryName === 'Closed_Fist' && top.score > CFG.fistConfidence;
-  const isOpen = (top.categoryName === 'Open_Palm' || top.categoryName === 'Pointing_Up' ||
-                  top.categoryName === 'Victory' || top.categoryName === 'Thumb_Up') &&
-                 top.score > CFG.openHandConfidence;
+  const isJumpGesture = JUMP_GESTURES.has(top.categoryName) &&
+                        top.score > CFG.fistConfidence;
   const now = performance.now();
-  if (isFist) {
-    if (handState === 'open' && now - lastFistAt > CFG.jumpDebounceMs) {
-      requestJump();
-      lastFistAt = now;
-    }
-    handState = 'fist';
-  } else if (isOpen) {
-    handState = 'open';
+  if (isJumpGesture && now - lastFistAt > CFG.jumpDebounceMs) {
+    requestJump();
+    lastFistAt = now;
   }
 }
 

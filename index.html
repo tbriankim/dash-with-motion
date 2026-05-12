@@ -258,39 +258,53 @@ const LEVELS = [
 ];
 
 // =============================================================
-// PHYSICS — smaller blocks now (32 instead of 42)
+// PHYSICS — matches real Geometry Dash
 // =============================================================
+// Researched values from the GD community (camila314/gdp decomp,
+// gdforum P1kachu physics analysis, GD wiki):
+//   * Cube speed at 1x  = 10.41 blocks/sec
+//   * Jump airtime      ~ 0.58 s  (single parabola, SYMMETRIC gravity)
+//   * Jump height       ~ 2.13 blocks above ground
+//   * Horizontal jump   ~ 6 blocks at 1x
+//   * Hold-to-jump      = yes (every landing while jump held re-jumps)
+//   * Coyote time       = no (cube must be grounded)
+// We pick a virtual block in pixels so the game scales with screen size.
 const BLOCK_PX = 32;
-const JUMP_HEIGHT_BLOCKS = 2.6;
-const JUMP_RISE_S = 0.22;
-const JUMP_FALL_S = 0.18;
+const JUMP_HEIGHT_BLOCKS = 2.13;             // GD canonical
+const JUMP_AIRTIME_S = 0.58;                 // GD canonical
+// Single symmetric gravity from height + airtime: g = 8H / T²
 const _h = JUMP_HEIGHT_BLOCKS * BLOCK_PX;
-const _gUp = (2 * _h) / (JUMP_RISE_S * JUMP_RISE_S);
-const _gDown = (2 * _h) / (JUMP_FALL_S * JUMP_FALL_S);
-const _v0 = -_gUp * JUMP_RISE_S;
+const _g = (8 * _h) / (JUMP_AIRTIME_S * JUMP_AIRTIME_S);   // ~1620 px/s²
+const _v0 = -(_g * JUMP_AIRTIME_S) / 2;                    // ~-470 px/s
 
 const CFG = {
-  gravityUp: _gUp,
-  gravityDown: _gDown,
+  gravity: _g,                       // symmetric — same on rise and fall
   jumpVelocity: _v0,
-  baseScrollSpeed: 9.5 * BLOCK_PX,   // levels multiply this
+  baseScrollSpeed: 10.41 * BLOCK_PX, // GD 1x = 333 px/s
   playerSize: BLOCK_PX,
   playerX: 110,
   groundOffset: 90,
-  coyoteTimeS: 0.10,
-  jumpBufferS: 0.14,
+  // forgiveness — GD itself has none, but a touch helps on a touchscreen
+  coyoteTimeS: 0.06,
+  jumpBufferS: 0.10,
+  // gesture
   jumpDebounceMs: 220,
   deathLockoutMs: 800,
   fistConfidence: 0.40,
+  // music
   musicBpm: 130,
   musicUrl: 'audio/track.mp3',
   musicVolume: 0.55,
 };
 
-const JUMP_ARC_S = JUMP_RISE_S + JUMP_FALL_S;
-const JUMP_DISTANCE_PX_BASE = CFG.baseScrollSpeed * JUMP_ARC_S;
-const MAX_CLUSTER_BLOCKS = (JUMP_DISTANCE_PX_BASE / BLOCK_PX) * 0.75;
-const MIN_REST_BLOCKS = (JUMP_DISTANCE_PX_BASE / BLOCK_PX) * 1.20;
+const JUMP_ARC_S = JUMP_AIRTIME_S;
+const JUMP_DISTANCE_PX_BASE = CFG.baseScrollSpeed * JUMP_ARC_S;        // ~193 px ≈ 6 blocks
+const JUMP_DISTANCE_BLOCKS_BASE = JUMP_DISTANCE_PX_BASE / BLOCK_PX;
+// Max width of an obstacle cluster that can be cleared in one jump.
+// 65% of jump distance leaves real reaction-time buffer.
+const MAX_CLUSTER_BLOCKS = JUMP_DISTANCE_BLOCKS_BASE * 0.65;          // ~3.9 blocks
+// Min rest distance between clusters: long enough to land, recover, jump.
+const MIN_REST_BLOCKS = JUMP_DISTANCE_BLOCKS_BASE * 1.10;             // ~6.6 blocks
 
 function currentScrollSpeed() {
   return CFG.baseScrollSpeed * (state.level?.speedMul || 1);
@@ -558,6 +572,10 @@ function step(dt) {
   state.coyoteRemaining = Math.max(0, state.coyoteRemaining - dt);
   state.jumpBufferRemaining = Math.max(0, state.jumpBufferRemaining - dt);
 
+  // Hold-to-jump: while finger is held down OR a fist is held in view, every
+  // grounded frame re-buffers a jump. Matches Geometry Dash.
+  if (pointerHeld && state.onGround) state.jumpBufferRemaining = CFG.jumpBufferS;
+
   const canJump = state.onGround || state.coyoteRemaining > 0;
   if (state.jumpBufferRemaining > 0 && canJump) {
     state.velY = CFG.jumpVelocity;
@@ -568,8 +586,8 @@ function step(dt) {
   }
 
   const wasOnGround = state.onGround;
-  const grav = state.velY < 0 ? CFG.gravityUp : CFG.gravityDown;
-  state.velY += grav * dt;
+  // GD uses symmetric gravity — single constant on the way up and down.
+  state.velY += CFG.gravity * dt;
   state.playerY += state.velY * dt;
   if (state.playerY >= 0) {
     state.playerY = 0; state.velY = 0; state.onGround = true;
@@ -847,15 +865,25 @@ function hideLeaderboard() {
 // =============================================================
 // INPUT
 // =============================================================
+// Track whether the user is currently holding the screen — like GD, holding
+// = repeated jumps every time the cube lands.
+let pointerHeld = false;
+function pointerEnabled(e) {
+  if (e.target.closest('.pill')) return false;
+  if (e.target.closest('input')) return false;
+  if (!document.getElementById('overlayDead').classList.contains('hidden')) return false;
+  if (!document.getElementById('overlayLeaderboard').classList.contains('hidden')) return false;
+  return true;
+}
 document.addEventListener('pointerdown', (e) => {
   initAudio();
-  if (e.target.closest('.pill')) return;
-  if (e.target.closest('input')) return;
-  // ignore taps inside any visible modal that has its own buttons
-  if (!document.getElementById('overlayDead').classList.contains('hidden')) return;
-  if (!document.getElementById('overlayLeaderboard').classList.contains('hidden')) return;
+  if (!pointerEnabled(e)) return;
+  pointerHeld = true;
   requestJump();
 });
+document.addEventListener('pointerup',     () => { pointerHeld = false; });
+document.addEventListener('pointercancel', () => { pointerHeld = false; });
+document.addEventListener('pointerleave',  () => { pointerHeld = false; });
 document.getElementById('retryBtn').addEventListener('click', (e) => {
   e.stopPropagation();
   if (state.dead) {
